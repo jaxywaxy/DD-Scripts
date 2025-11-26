@@ -24,7 +24,16 @@ def get_synthetic_tests(api_key: str, app_key: str) -> List[Dict[str, Any]]:
         }
         
         response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
+        
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            print(f"Error fetching synthetic tests: {e}")
+            print(f"Response status: {response.status_code}")
+            if response.status_code == 403:
+                print("403 Forbidden - Please check that your API key and Application key are valid and have proper permissions.")
+            print(f"Response body: {response.text[:500]}")
+            raise
         
         data = response.json()
         tests = data.get("tests", [])
