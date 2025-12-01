@@ -1,0 +1,78 @@
+# rum_retention_filters_export.py
+# Export Datadog RUM Retention Filters to an Excel spreadsheet.
+# Usage examples and dependency notes are at the top of the file.
+
+import os, sys, argparse
+import pandas as pd
+from typing import Optional, List
+
+from datadog_api_client import ApiClient, Configuration
+from datadog_api_client.v2.api.rum_api import RUMApi
+from datadog_api_client.v2.api.rum_retention_filters_api import RumRetentionFiltersApi
+from datadog_api_client.exceptions import ApiException
+
+def resolve_app_id(api_client: ApiClient, app_id: Optional[str], app_name: Optional[str]) -> str:
+    if app_id:
+        return app_id
+    if not app_name:
+        raise ValueError("Either --app-id or --app-name must be provided.")
+    rum_api = RUMApi(api_client)
+    apps = rum_api.get_rum_applications()
+    matches = [a for a in apps.data if getattr(a.attributes, 'name', None) == app_name]
+    if not matches:
+        raise ValueError(f"No RUM application found with name: {app_name}")
+    if len(matches) > 1:
+        ids = ", ".join([str(getattr(a, 'id', '')) for a in matches])
+        raise ValueError(f"Multiple applications matched name '{app_name}'. Specify --app-id. Matches: {ids}")
+    return str(getattr(matches[0], 'id'))
+
+def fetch_retention_filters(api_client: ApiClient, app_id: str) -> List[dict]:
+    rf_api = RumRetentionFiltersApi(api_client)
+    resp = rf_api.list_retention_filters(app_id=app_id)
+    rows = []
+    for item in resp.data:
+        attrs = item.attributes
+        rows.append({
+            'application_id': app_id,
+            'retention_filter_id': str(getattr(item, 'id', '')),
+            'name': getattr(attrs, 'name', None),
+            'event_type': getattr(attrs, 'event_type', None),
+            'query': getattr(attrs, 'query', None),
+            'sample_rate': getattr(attrs, 'sample_rate', None),
+            'enabled': getattr(attrs, 'enabled', None),
+        })
+    return rows
+
+def main():
+    parser = argparse.ArgumentParser(description='Export Datadog RUM Retention Filters to Excel')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--app-id', help='RUM application ID (UUID)')
+    group.add_argument('--app-name', help='Exact name of the RUM application')
+    parser.add_argument('--out', default='rum_retention_filters.xlsx', help='Output Excel file path (.xlsx)')
+    parser.add_argument('--sheet', default='RUM Retention Filters', help='Worksheet name')
+    parser.add_argument('--site', default=os.getenv('DD_SITE', 'datadoghq.com'), help='Datadog site')
+    args = parser.parse_args()
+
+    config = Configuration()
+    config.server_variables = {"site": args.site}
+
+    if not os.getenv('DD_API_KEY') or not os.getenv('DD_APP_KEY'):
+        print("ERROR: DD_API_KEY and DD_APP_KEY environment variables must be set.", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        with ApiClient(config) as api_client:
+            target_app_id = resolve_app_id(api_client, args.app_id, args.app_name)
+            rows = fetch_retention_filters(api_client, target_app_id)
+            df = pd.DataFrame(rows)
+            with pd.ExcelWriter(args.out, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name=args.sheet)
+            print(f"Exported {len(rows)} retention filters for app '{target_app_id}' to {args.out}")
+    except ApiException as e:
+        print(f"Datadog API error: {e}", file=sys.stderr); sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr); sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+
