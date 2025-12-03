@@ -2,8 +2,8 @@ import requests
 import pandas as pd
 
 # Replace with your actual Datadog API and application keys
-API_KEY = '18e183169f294e1ca086aad04f79a8ab'
-APP_KEY = 'deef80f300fbb478c1d2f2f16b33bcdc591185c4'
+API_KEY = '04fc0e440c511f276734d7880b682e23'
+APP_KEY = 'fa74a5626ea6022f1338232276561cebcd955ff7'
 
 # Team tag to filter monitors
 TEAM_TAG = 'team:ge-integration'

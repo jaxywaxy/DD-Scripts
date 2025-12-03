@@ -1,0 +1,210 @@
+
+{
+  "data": {
+    "type": "workflows",
+    "attributes": {
+      "name": "RUM Retention Throttle+Restore",
+      "description": "Throttle all RUM retention filters to 0% and restore them later from Datastore.",
+      "published": true,
+      "triggers": [
+        {
+          "type": "monitor",
+          "monitorTrigger": {
+            "mentionHandle": "@workflow-rum-throttle-restore",
+            "startStepNames": ["decide-mode"]
+          }
+        },
+        {
+          "type": "schedule",
+          "scheduleTrigger": {
+            "cron": "1 0 * * *",
+            "timezone": "UTC",
+            "startStepNames": ["decide-mode"],
+            "inputs": {
+              "mode": "restore"
+            }
+          }
+        },
+        {
+          "type": "manual",
+          "manualTrigger": {
+            "startStepNames": ["decide-mode"]
+          }
+        }
+      ],
+      "inputs": [
+        { "name": "mode", "type": "string", "default": "throttle", "description": "throttle | restore" },
+        { "name": "apps_scope", "type": "string", "default": "all", "description": "all | list_of_ids | list_of_names" },
+        { "name": "app_ids", "type": "string", "required": false, "description": "Comma-separated app IDs when apps_scope=list_of_ids" },
+        { "name": "app_names", "type": "string", "required": false, "description": "Comma-separated app names when apps_scope=list_of_names" },
+        { "name": "snapshot_tag", "type": "string", "default": "daily", "description": "Tag to group snapshots in Datastore" }
+      ],
+      "steps": [
+        {
+          "name": "decide-mode",
+          "type": "javascript",
+          "javascript": {
+            "code": "return { branch: (inputs.mode || 'throttle').toLowerCase() };"
+          },
+          "transitions": [
+            { "condition": "{{ step.decide-mode.output.branch == 'throttle' }}", "next": "list-apps" },
+            { "condition": "{{ step.decide-mode.output.branch == 'restore' }}", "next": "datastore-read" }
+          ]
+        },
+
+        /* ------------------ THROTTLE BRANCH ------------------ */
+
+        {
+          "name": "list-apps",
+          "type": "http",
+          "http": {
+            "method": "GET",
+            "url": "https://api.datadoghq.com/api/v2/rum/applications",
+            "headers": {
+              "DD-API-KEY": "{{ secrets.dd_api_key }}",
+              "DD-APPLICATION-KEY": "{{ secrets.dd_app_key }}",
+              "Accept": "application/json"
+            }
+          },
+          "transitions": [{ "next": "select-apps" }]
+        },
+        {
+          "name": "select-apps",
+          "type": "javascript",
+          "javascript": {
+            "code": "const scope = (inputs.apps_scope||'all').toLowerCase();\nconst listed = step['list-apps'].response.data || [];\nfunction idsFromNames(names, apps) {\n  const nset = new Set((names||'').split(',').map(s=>s.trim()).filter(Boolean));\n  return apps.filter(a=>nset.has((a.attributes?.name)||'' ) ).map(a=>a.id);\n}\nlet targetIds = [];\nif(scope==='all'){ targetIds = listed.map(a=>a.id); }\nelse if(scope==='list_of_ids'){ targetIds = (inputs.app_ids||'').split(',').map(s=>s.trim()).filter(Boolean); }\nelse if(scope==='list_of_names'){ targetIds = idsFromNames(inputs.app_names, listed); }\nreturn { app_ids: targetIds };\n"
+          },
+          "transitions": [{ "next": "for-each-app-throttle" }]
+        },
+        {
+          "name": "for-each-app-throttle",
+          "type": "loop",
+          "loop": {
+            "items": "{{ step.select-apps.output.app_ids }}",
+            "itemName": "app_id"
+          },
+          "transitions": [{ "next": "list-filters" }]
+        },
+        {
+          "name": "list-filters",
+          "type": "http",
+          "http": {
+            "method": "GET",
+            "url": "https://api.datadoghq.com/api/v2/rum/applications/{{ loop.app_id }}/retention_filters",
+            "headers": {
+              "DD-API-KEY": "{{ secrets.dd_api_key }}",
+              "DD-APPLICATION-KEY": "{{ secrets.dd_app_key }}",
+              "Accept": "application/json"
+            }
+          },
+          "transitions": [{ "next": "snapshot-to-datastore" }]
+        },
+        {
+          "name": "snapshot-to-datastore",
+          "type": "datastore_write",
+          "datastoreWrite": {
+            "datastore": "rum_retention_snapshots",
+            "items": "{{ step.list-filters.response.data | map(item => ({ key: item.id, value: { app_id: loop.app_id, filter_id: item.id, name: item.attributes.name, event_type: item.attributes.event_type, query: item.attributes.query, sample_rate_before: item.attributes.sample_rate, enabled_before: item.attributes.enabled, snapshot_tag: inputs.snapshot_tag, snapshot_ts: now() } })) }}"
+          },
+          "transitions": [{ "next": "for-each-filter-throttle" }]
+        },
+        {
+          "name": "for-each-filter-throttle",
+          "type": "loop",
+          "loop": {
+            "items": "{{ step.list-filters.response.data }}",
+            "itemName": "filter"
+          },
+          "transitions": [{ "next": "update-filter-zero" }]
+        },
+        {
+          "name": "update-filter-zero",
+          "type": "http",
+          "http": {
+            "method": "PATCH",
+            "url": "https://api.datadoghq.com/api/v2/rum/applications/{{ loop.app_id }}/retention_filters/{{ loop.filter.id }}",
+            "headers": {
+              "DD-API-KEY": "{{ secrets.dd_api_key }}",
+              "DD-APPLICATION-KEY": "{{ secrets.dd_app_key }}",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "data": {
+                "id": "{{ loop.filter.id }}",
+                "type": "retention_filters",
+                "attributes": { "sample_rate": 0 }
+              }
+            }
+          },
+          "transitions": [
+            { "condition": "{{ loop.hasNext }}", "next": "for-each-filter-throttle" },
+            { "next": "throttle-complete" }
+          ]
+        },
+        {
+          "name": "throttle-complete",
+          "type": "javascript",
+          "javascript": { "code": "return { message: 'Throttle complete: all targeted filters set to 0%' }" }
+        },
+
+        /* ------------------ RESTORE BRANCH ------------------ */
+
+        {
+          "name": "datastore-read",
+          "type": "datastore_read",
+          "datastoreRead": {
+            "datastore": "rum_retention_snapshots",
+            "query": {
+              "where": { "snapshot_tag": "{{ inputs.snapshot_tag }}" },
+              "limit": 10000
+            }
+          },
+          "transitions": [{ "next": "for-each-snapshot" }]
+        },
+        {
+          "name": "for-each-snapshot",
+          "type": "loop",
+          "loop": {
+            "items": "{{ step.datastore-read.items }}",
+            "itemName": "snap"
+          },
+          "transitions": [{ "next": "restore-filter" }]
+        },
+        {
+          "name": "restore-filter",
+          "type": "http",
+          "http": {
+            "method": "PATCH",
+            "url": "https://api.datadoghq.com/api/v2/rum/applications/{{ loop.snap.value.app_id }}/retention_filters/{{ loop.snap.value.filter_id }}",
+            "headers": {
+              "DD-API-KEY": "{{ secrets.dd_api_key }}",
+              "DD-APPLICATION-KEY": "{{ secrets.dd_app_key }}",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "data": {
+                "id": "{{ loop.snap.value.filter_id }}",
+                "type": "retention_filters",
+                "attributes": {
+                  "sample_rate": "{{ loop.snap.value.sample_rate_before }}",
+                  "enabled": "{{ loop.snap.value.enabled_before }}",
+                  "query": "{{ loop.snap.value.query }}"
+                }
+              }
+            }
+          },
+          "transitions": [
+            { "condition": "{{ loop.hasNext }}", "next": "for-each-snapshot" },
+            { "next": "restore-complete" }
+          ]
+        },
+        {
+          "name": "restore-complete",
+          "type": "javascript",
+          "javascript": { "code": "return { message: 'Restore complete: all filters returned to original settings' }" }
+        }
+      ]
+    }
+  }
+}
+

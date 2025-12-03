@@ -1,0 +1,399 @@
+
+import requests
+from requests import HTTPError
+
+def _list_teams_by_keyword(keyword: str):
+    """
+    Use Teams API v2 to find the team and its handle.
+    Docs: GET /api/v2/team with filter[keyword]
+    """
+    url = f"https://api.{SITE}/api/v2/team"
+    params = {"filter[keyword]": keyword, "page[size]": 100}
+    r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json().get("data", []) or []
+
+def _extract_team_handle(keyword: str) -> str:
+    """
+    Attempt to resolve a team handle from either a display name or an existing handle.
+    Prefer exact name/handle match; otherwise take the first hit.
+    """
+    teams = _list_teams_by_keyword(keyword)
+    if not teams:
+        # If keyword already looks like a handle, return it as-is
+        return keyword.strip().lower().replace(" ", "-")
+    # Try exact match on name or handle
+    for t in teams:
+        attrs = t.get("attributes", {}) or {}
+        name = attrs.get("name", "")
+        handle = attrs.get("handle", "")
+        if keyword.lower() in (name.lower(), handle.lower()):
+            return handle
+    # Fallback to first
+    return teams[0].get("attributes", {}).get("handle", keyword.strip().lower().replace(" ", "-"))
+
+def find_monitors_for_team(team_input: str):
+    """
+    Resolves team handle, then queries Monitors Search API using robust variants.
+    """
+    handle = _extract_team_handle(team_input)
+    # Build query variants (singular vs plural field; quoted vs unquoted)
+    variants = [
+        f'team:{handle}',
+        f'team:"{handle}"',
+        f'teams:{handle}',
+        f'teams:"{handle}"',
+    ]
+
+    last_err = None
+    for q in variants:
+        try:
+            data = datadog_get(f"{BASE_V1}/monitor/search", params={"query": q})
+            candidates = []
+            if isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], dict) and "monitors" in data["data"]:
+                    candidates = data["data"]["monitors"]
+                elif "monitors" in data:
+                    candidates = data["monitors"]
+            monitors = [{"id": m.get("id"), "name": m.get("name")} for m in (candidates or []) if m.get("id") is not None]
+            if monitors:
+                return monitors
+            # If the call worked but no monitors returned, try next variant
+        except HTTPError as e:
+            # 400 implies an unrecognized field/query grammar; try next variant
+            last_err = e
+            continue
+
+    # If all variants failed or yielded nothing, surface a helpful message
+    if last_err:
+        raise RuntimeError(
+            f"Failed to search monitors for team '{team_input}' (resolved handle '{handle}'). "
+            f"Last error: {last_err}"
+        )
+    else:
+        # No error, but empty result
+
+#!/usr/bin/env python3
+"""
+Pull monitor alerts from the past N days for monitors assigned to a given Datadog Team.
+Outputs CSV: alert_id,monitor_id,monitor_name,monitor_status,monitor_group,triggered_at,resolved_at,link
+
+Usage:
+  export DD_API_KEY=...
+  export DD_APP_KEY=...
+  export DD_SITE=datadoghq.com
+  python datadog_alerts_by_team.py --team platform --days 7 --out alerts.csv
+"""
+
+import os, sys, csv, time, argparse, datetime as dt, requests
+
+API_KEY = os.getenv("DD_API_KEY"); APP_KEY = os.getenv("DD_APP_KEY"); SITE = os.getenv("DD_SITE", "datadoghq.com")
+if not API_KEY or not APP_KEY:
+    print("Missing DD_API_KEY or DD_APP_KEY", file=sys.stderr); sys.exit(1)
+
+BASE_V1 = f"https://api.{SITE}/api/v1"
+BASE_V2 = f"https://api.{SITE}/api/v2"
+HEADERS = {"DD-API-KEY": API_KEY, "DD-APPLICATION-KEY": APP_KEY, "Content-Type": "application/json", "Accept": "application/json"}
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--team", required=True, help="Datadog team handle (e.g., 'platform').")
+    ap.add_argument("--days", type=int, default=7, help="Look-back window in days.")
+    ap.add_argument("--out", default="alerts.csv", help="Output CSV filename.")
+    return ap.parse_args()
+
+def datadog_get(url, params=None):
+    r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+    r.raise_for_status(); return r.json()
+
+def find_monitors_for_team(team_handle: str):
+    """
+    Uses Monitors Search API (v1) with the Manage Monitors query grammar.
+    Query example: teams:platform
+    """
+    # Teams appear in search/facets as team:<handle> / teams:<handle>. [1](https://docs.datadoghq.com/account_management/teams/)
+    q = f"teams:{team_handle}"
+    data = datadog_get(f"{BASE_V1}/monitor/search", params={"query": q})
+    monitors = []
+    candidates = []
+    if isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], dict) and "monitors" in data["data"]:
+            candidates = data["data"]["monitors"]
+        elif "monitors" in data:
+            candidates = data["monitors"]
+    # We trust the search filter to return team-associated monitors; collect ids & names. [2](https://docs.datadoghq.com/monitors/manage/)
+    for m in candidates or []:
+        mid = m.get("id"); name = m.get("name")
+        if mid is not None:
+            monitors.append({"id": mid, "name": name})
+    return monitors
+
+def chunks(seq, size): 
+    for i in range(0, len(seq), size): 
+        yield seq[i:i+size]
+
+def list_monitor_alert_events(mids, since_ms, until_ms):
+    """
+    Events API (v2): filter by @monitor.id and category:alert, paginate via page[cursor].
+    """
+    results = []
+    for group in chunks(mids, 50):
+        id_terms = " OR ".join([f"@monitor.id:{mid}" for mid in group])
+        query = f"({id_terms}) AND category:alert"  # recommended for monitor events. [3](https://docs.datadoghq.com/api/latest/events/)
+        params = {
+            "filter[query]": query,
+            "filter[from]": str(since_ms),
+            "filter[to]": str(until_ms),
+            "page[limit]": "1000",
+            "sort": "-timestamp",
+        }
+        cursor = None
+        while True:
+            if cursor:
+                params["page[cursor]"] = cursor
+            resp = datadog_get(f"{BASE_V2}/events", params=params)
+            results.extend(resp.get("data", []))
+            cursor = resp.get("meta", {}).get("page", {}).get("next_cursor")
+            if not cursor:
+                break
+            time.sleep(0.2)
+    return results
+
+def to_iso(ms):
+    import datetime as dt
+    try: return dt.datetime.utcfromtimestamp(ms/1000.0).isoformat() + "Z"
+    except: return ""
+
+def main():
+    args = parse_args()
+    now_ms = int(time.time() * 1000); since_ms = now_ms - args.days*24*60*60*1000
+
+    monitors = find_monitors_for_team(args.team)
+    if not monitors:
+        print(f"No monitors found for team handle: {args.team}"); sys.exit(0)
+
+    id_to_name = {m["id"]: m["name"] for m in monitors}
+    events = list_monitor_alert_events(list(id_to_name.keys()), since_ms, now_ms)
+
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["alert_id","monitor_id","monitor_name","monitor_status","monitor_group",
+                    "triggered_at","resolved_at","monitor_link"])
+        for e in events:
+            attrs = e.get("attributes", {}) or {}
+            bag   = attrs.get("attributes", {}) or {}
+            monitor_id   = bag.get("monitor.id") or bag.get("@monitor.id")
+            monitor_name = id_to_name.get(int(monitor_id)) if monitor_id and str(monitor_id).isdigit() else bag.get("monitor.name") or attrs.get("title") or ""
+            monitor_grp  = bag.get("monitor.group") or ""
+            monitor_stat = bag.get("monitor.status") or bag.get("@monitor.status") or ""
+            triggered_ms = attrs.get("timestamp")
+            resolved_ms  = bag.get("monitor.resolved_ts")  # may be absent
+
+            link = f"https://app.{SITE}/monitors/{monitor_id}" if monitor_id else ""
+            w.writerow([e.get("id"), monitor_id or "", monitor_name, monitor_stat, monitor_grp,
+                        to_iso(triggered_ms) if triggered_ms else "", to_iso(resolved_ms) if resolved_ms else "", link])
+
+    print(f"✔ Wrote {len(events)} alert event rows to {args.out}")
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python3
+"""
+Pull monitor alerts from the past 7 days for monitors tagged with a given monitor tag.
+Outputs CSV: alert_id,monitor_id,monitor_name,monitor_status,monitor_group,triggered_at,resolved_at,link
+
+Usage:
+  export DD_API_KEY=...
+  export DD_APP_KEY=...
+  export DD_SITE=datadoghq.com
+  python datadog_alerts_by_tag.py --tag team:platform --days 7 --out alerts.csv
+"""
+
+import os
+import sys
+import csv
+import time
+import argparse
+import datetime as dt
+import requests
+
+API_KEY = os.getenv("DD_API_KEY")
+APP_KEY = os.getenv("DD_APP_KEY")
+SITE    = os.getenv("DD_SITE", "datadoghq.com")
+
+if not API_KEY or not APP_KEY:
+    print("Missing DD_API_KEY or DD_APP_KEY environment variables.", file=sys.stderr)
+    sys.exit(1)
+
+BASE_V1 = f"https://api.{SITE}/api/v1"
+BASE_V2 = f"https://api.{SITE}/api/v2"
+
+HEADERS = {
+    "DD-API-KEY": API_KEY,
+    "DD-APPLICATION-KEY": APP_KEY,
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tag", required=True,
+                    help="Monitor tag to match (e.g., 'team:platform'). Use exact monitor tag.")
+    ap.add_argument("--days", type=int, default=7,
+                    help="Look-back window in days (default: 7).")
+    ap.add_argument("--out", default="alerts.csv",
+                    help="Output CSV filename (default: alerts.csv).")
+    return ap.parse_args()
+
+def datadog_get(url, params=None):
+    r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def find_monitors_with_tag(tag):
+    """
+    Uses Monitors Search API (v1) with query grammar from Manage Monitors.
+    Query example: tag:team:platform
+    """
+    # The Manage Monitors search supports Tag filtering; the API accepts the same query param. [1](https://docs.datadoghq.com/monitors/manage/search/)[2](https://www.rubydoc.info/gems/datadog_api_client/DatadogAPIClient/V1/MonitorsAPI:search_monitors_with_http_info)
+    q = f'tag:{tag}'
+    data = datadog_get(f"{BASE_V1}/monitor/search", params={"query": q})
+    # Response is MonitorSearchResponse; pull monitor details.
+    monitors = []
+    # Be tolerant to structure; both 'data' and 'monitors' keys appear depending on client versions.
+    candidates = []
+    if isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], dict) and "monitors" in data["data"]:
+            candidates = data["data"]["monitors"]
+        elif "monitors" in data:
+            candidates = data["monitors"]
+
+    for m in candidates or []:
+        # Expect id, name, tags fields
+        mid   = m.get("id")
+        name  = m.get("name")
+        tags  = m.get("tags", [])
+        if mid is not None and any(t == tag for t in tags):
+            monitors.append({"id": mid, "name": name, "tags": tags})
+    return monitors
+
+def chunks(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
+
+def list_monitor_alert_events(mids, since_ms, until_ms):
+    """
+    Uses Events API (v2) list endpoint with events search query.
+    Filters by @monitor.id and category:alert.
+    Paginates with page[cursor].
+    """
+    # Using events search with @monitor.id is recommended for monitor events filtering. [3](https://docs.datadoghq.com/api/latest/events/)
+    results = []
+    # Build OR query across monitor IDs (chunk to avoid overly long query strings).
+    for group in chunks(mids, 50):
+        id_terms = " OR ".join([f'@monitor.id:{mid}' for mid in group])
+        query = f"({id_terms}) AND category:alert"
+        # Arguments filter[query], filter[from]/filter[to] in milliseconds. [3](https://docs.datadoghq.com/api/latest/events/)
+        params = {
+            "filter[query]": query,
+            "filter[from]": str(since_ms),
+            "filter[to]": str(until_ms),
+            "page[limit]": "1000",
+            "sort": "-timestamp"
+        }
+
+        cursor = None
+        while True:
+            if cursor:
+                params["page[cursor]"] = cursor
+            resp = datadog_get(f"{BASE_V2}/events", params=params)
+            data = resp.get("data", [])
+            results.extend(data)
+            cursor = resp.get("meta", {}).get("page", {}).get("next_cursor")
+            if not cursor:
+                break
+            # Be gentle to API
+            time.sleep(0.2)
+    return results
+
+def safe_get(dct, path, default=None):
+    """Safely traverse nested dict with keys list."""
+    cur = dct
+    for k in path:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+def to_iso(ms):
+    try:
+        return dt.datetime.utcfromtimestamp(ms/1000.0).isoformat() + "Z"
+    except Exception:
+        return ""
+
+def main():
+    args = parse_args()
+    # Time window
+    now = int(time.time() * 1000)
+    since = now - args.days * 24 * 60 * 60 * 1000
+
+    monitors = find_monitors_with_tag(args.tag)
+    if not monitors:
+        print(f"No monitors found with tag: {args.tag}")
+        sys.exit(0)
+
+    id_to_name = {m["id"]: m.get("name", "") for m in monitors}
+    monitor_ids = list(id_to_name.keys())
+
+    events = list_monitor_alert_events(monitor_ids, since, now)
+
+    # Write CSV
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["alert_id","monitor_id","monitor_name","monitor_status","monitor_group",
+                    "triggered_at","resolved_at","monitor_link"])
+        for e in events:
+            # v2 events response contains 'attributes' with event data; schema varies by source,
+            # but monitor events typically expose @monitor.* attributes and timestamps.
+            attrs = e.get("attributes", {}) or {}
+            # timestamps in milliseconds
+            ts = safe_get(attrs, ["timestamp"], None)
+            title = safe_get(attrs, ["title"], "")
+            tags  = safe_get(attrs, ["tags"], [])
+            # custom attributes bag (sometimes under 'attributes'->'attributes')
+            bag   = safe_get(attrs, ["attributes"], {}) or {}
+            monitor_id   = bag.get("monitor.id") or bag.get("@monitor.id") or None
+            monitor_name = bag.get("monitor.name") or title
+            monitor_grp  = bag.get("monitor.group") or ""
+            monitor_stat = bag.get("monitor.status") or bag.get("@monitor.status") or ""
+
+            # resolved_at: not always present in v2; keep blank if missing
+            resolved_ms = bag.get("monitor.resolved_ts") or None
+
+            # Fallback to id from relationships if attribute bag missing
+            if not monitor_id:
+                rel = e.get("relationships", {}) or {}
+                # some orgs include event-to-monitor relation; if not, stick to None
+                monitor_id = rel.get("monitor", {}).get("data", {}).get("id")
+
+            mon_name = id_to_name.get(int(monitor_id)) if monitor_id and str(monitor_id).isdigit() else monitor_name
+            link = f"https://app.{SITE}/monitors/{monitor_id}" if monitor_id else ""
+
+            w.writerow([
+                e.get("id"),
+                monitor_id or "",
+                mon_name or "",
+                monitor_stat or "",
+                monitor_grp or "",
+                to_iso(ts) if ts else "",
+                to_iso(resolved_ms) if resolved_ms else "",
+                link
+            ])
+
+    print(f"✔ Wrote {len(events)} alert event rows to {args.out}")
+
+if __name__ == "__main__":
+    main()
+
